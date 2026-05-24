@@ -4,7 +4,7 @@ ENV PYTHONUNBUFFERED=1
 ENV CHROMIUM_PATH=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 ENV OUT_DIR=/tmp/blogger-test
-ENV CACHE_TTL=900
+ENV CACHE_TTL=0
 ENV WAIT_SECONDS=45
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
