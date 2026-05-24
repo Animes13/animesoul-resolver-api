@@ -33,10 +33,15 @@ OUT_DIR = Path(os.environ.get("OUT_DIR", "/tmp/blogger-test"))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 0 = não guardar link temporário.
-# Isso força resolver de novo a cada chamada.
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "0"))
+# 300 = guarda por 5 minutos para acelerar.
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
+WAIT_SECONDS = int(os.environ.get("WAIT_SECONDS", "12"))
 
-WAIT_SECONDS = int(os.environ.get("WAIT_SECONDS", "45"))
+# DEBUG_SAVE=1 salva html/png/logs. Em produção deixe 0.
+DEBUG_SAVE = os.environ.get("DEBUG_SAVE", "0") == "1"
+
+# KEEP_DRIVER=1 mantém o Chromium aberto para acelerar próximas chamadas.
+KEEP_DRIVER = os.environ.get("KEEP_DRIVER", "1") == "1"
 
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 10) "
@@ -45,6 +50,40 @@ USER_AGENT = (
 
 cache = {}
 cache_lock = threading.Lock()
+
+DRIVER = None
+DRIVER_LOCK = threading.Lock()
+
+
+# ============================================================
+# DRIVER GLOBAL
+# ============================================================
+
+def reset_driver():
+    global DRIVER
+
+    try:
+        if DRIVER:
+            DRIVER.quit()
+    except Exception:
+        pass
+
+    DRIVER = None
+
+
+def get_driver():
+    global DRIVER
+
+    if not KEEP_DRIVER:
+        driver = criar_driver()
+        driver.set_page_load_timeout(45)
+        return driver
+
+    if DRIVER is None:
+        DRIVER = criar_driver()
+        DRIVER.set_page_load_timeout(45)
+
+    return DRIVER
 
 
 # ============================================================
@@ -188,11 +227,6 @@ def escolher_melhor_url(urls):
 
 
 def build_base_url(request: Request):
-    """
-    Monta a URL base pública.
-    No Render, normalmente fica:
-    https://animesoul-resolver-api.onrender.com
-    """
     forwarded_proto = request.headers.get("x-forwarded-proto")
     forwarded_host = request.headers.get("x-forwarded-host")
 
@@ -239,6 +273,13 @@ def cache_set(url, result):
 def criar_driver():
     options = Options()
     options.binary_location = CHROMIUM
+    options.page_load_strategy = "eager"
+
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
 
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -276,6 +317,9 @@ class BloggerResolver:
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
     def salvar_estado(self, driver, nome):
+        if not DEBUG_SAVE:
+            return
+
         try:
             html_path = self.out_dir / f"{nome}.html"
             png_path = self.out_dir / f"{nome}.png"
@@ -353,7 +397,7 @@ class BloggerResolver:
         except Exception:
             pass
 
-        time.sleep(3)
+        time.sleep(1.5)
         self.analisar_logs(driver)
 
         # Clique real no botão play
@@ -363,7 +407,7 @@ class BloggerResolver:
         except Exception:
             pass
 
-        time.sleep(5)
+        time.sleep(2)
         self.analisar_logs(driver)
 
         # Clique no main
@@ -373,7 +417,7 @@ class BloggerResolver:
         except Exception:
             pass
 
-        time.sleep(5)
+        time.sleep(2)
         self.analisar_logs(driver)
 
         # Clique no centro da tela
@@ -391,7 +435,7 @@ class BloggerResolver:
         except Exception:
             pass
 
-        time.sleep(8)
+        time.sleep(3)
         self.analisar_logs(driver)
 
     def tentar_video_js(self, driver):
@@ -407,6 +451,9 @@ class BloggerResolver:
             pass
 
     def salvar_iframes(self, driver):
+        if not DEBUG_SAVE:
+            return
+
         try:
             driver.switch_to.default_content()
         except Exception:
@@ -437,7 +484,6 @@ class BloggerResolver:
                 except Exception:
                     pass
 
-                # Vídeos dentro do iframe
                 try:
                     videos = driver.find_elements("tag name", "video")
 
@@ -457,7 +503,6 @@ class BloggerResolver:
                 except Exception:
                     pass
 
-                # URLs dentro do HTML do iframe
                 urls = re.findall(r'https?://[^"\'<>\\]+', html)
 
                 for u in urls:
@@ -486,6 +531,9 @@ class BloggerResolver:
                     pass
 
     def salvar_debug(self):
+        if not DEBUG_SAVE:
+            return
+
         try:
             logs_path = self.out_dir / "network_logs.json"
             logs_path.write_text(
@@ -512,12 +560,10 @@ class BloggerResolver:
         driver = None
 
         try:
-            driver = criar_driver()
-            driver.set_page_load_timeout(60)
-
+            driver = get_driver()
             driver.get(self.url)
 
-            time.sleep(8)
+            time.sleep(3)
 
             self.salvar_estado(driver, "blogger_antes")
             self.analisar_logs(driver)
@@ -539,11 +585,10 @@ class BloggerResolver:
                 self.salvar_debug()
                 return best
 
-            # Observa rede por alguns segundos
             for i in range(WAIT_SECONDS):
                 self.analisar_logs(driver)
 
-                if i in (10, 20, 30, 40):
+                if i in (3, 6, 9):
                     self.tentar_video_js(driver)
                     self.salvar_iframes(driver)
 
@@ -558,8 +603,12 @@ class BloggerResolver:
 
             return escolher_melhor_url(self.achados_midia)
 
+        except Exception:
+            reset_driver()
+            raise
+
         finally:
-            if driver:
+            if driver and not KEEP_DRIVER:
                 try:
                     driver.quit()
                 except Exception:
@@ -577,6 +626,7 @@ def home():
         "name": "AnimeSoul Blogger Resolver API",
         "endpoints": {
             "health": "/health",
+            "warmup": "/warmup",
             "resolve": "/resolve?url=https://www.blogger.com/video.g?token=TOKEN",
             "stream": "/stream?url=URL_DA_MIDIA"
         }
@@ -591,7 +641,41 @@ def health():
         "chromedriver": CHROMEDRIVER,
         "cache_ttl": CACHE_TTL,
         "cache_items": len(cache),
+        "wait_seconds": WAIT_SECONDS,
+        "debug_save": DEBUG_SAVE,
+        "keep_driver": KEEP_DRIVER,
+        "driver_loaded": DRIVER is not None,
     }
+
+
+@app.get("/warmup")
+def warmup():
+    """
+    Acorda o servidor e deixa o Chromium pronto.
+    """
+    try:
+        with DRIVER_LOCK:
+            driver = get_driver()
+            driver.get("about:blank")
+
+        return {
+            "ok": True,
+            "message": "Servidor aquecido",
+            "keep_driver": KEEP_DRIVER,
+            "cache_ttl": CACHE_TTL,
+            "wait_seconds": WAIT_SECONDS,
+            "driver_loaded": DRIVER is not None,
+        }
+
+    except Exception as e:
+        reset_driver()
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": str(e),
+            }
+        )
 
 
 @app.get("/resolve")
@@ -629,8 +713,9 @@ def resolve_endpoint(
         }
 
     try:
-        resolver = BloggerResolver(url)
-        final_url = resolver.resolve()
+        with DRIVER_LOCK:
+            resolver = BloggerResolver(url)
+            final_url = resolver.resolve()
 
         if final_url:
             final_url = clean_url(final_url)
@@ -698,7 +783,6 @@ def stream_endpoint(
             "Connection": "keep-alive",
         }
 
-        # Importante para o Kodi conseguir avançar/continuar vídeo
         range_header = request.headers.get("range")
 
         if range_header:
