@@ -7,10 +7,11 @@ import time
 import hashlib
 import threading
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, quote_plus
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+import requests
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -31,7 +32,10 @@ CHROMEDRIVER = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/tmp/blogger-test"))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "900"))  # 15 minutos
+# 0 = não guardar link temporário.
+# Isso força resolver de novo a cada chamada.
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "0"))
+
 WAIT_SECONDS = int(os.environ.get("WAIT_SECONDS", "45"))
 
 USER_AGENT = (
@@ -183,7 +187,25 @@ def escolher_melhor_url(urls):
     return urls[0]
 
 
+def build_base_url(request: Request):
+    """
+    Monta a URL base pública.
+    No Render, normalmente fica:
+    https://animesoul-resolver-api.onrender.com
+    """
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+
+    if forwarded_proto and forwarded_host:
+        return "%s://%s" % (forwarded_proto, forwarded_host)
+
+    return str(request.base_url).rstrip("/")
+
+
 def cache_get(url):
+    if CACHE_TTL <= 0:
+        return None
+
     now = time.time()
 
     with cache_lock:
@@ -200,6 +222,9 @@ def cache_get(url):
 
 
 def cache_set(url, result):
+    if CACHE_TTL <= 0:
+        return
+
     with cache_lock:
         cache[url] = {
             "time": time.time(),
@@ -552,7 +577,8 @@ def home():
         "name": "AnimeSoul Blogger Resolver API",
         "endpoints": {
             "health": "/health",
-            "resolve": "/resolve?url=https://www.blogger.com/video.g?token=TOKEN"
+            "resolve": "/resolve?url=https://www.blogger.com/video.g?token=TOKEN",
+            "stream": "/stream?url=URL_DA_MIDIA"
         }
     }
 
@@ -563,12 +589,16 @@ def health():
         "ok": True,
         "chromium": CHROMIUM,
         "chromedriver": CHROMEDRIVER,
+        "cache_ttl": CACHE_TTL,
         "cache_items": len(cache),
     }
 
 
 @app.get("/resolve")
-def resolve_endpoint(url: str = Query(..., description="Blogger video.g token URL")):
+def resolve_endpoint(
+    request: Request,
+    url: str = Query(..., description="Blogger video.g token URL")
+):
     url = clean_url(url)
 
     if not is_valid_blogger_url(url):
@@ -581,12 +611,21 @@ def resolve_endpoint(url: str = Query(..., description="Blogger video.g token UR
             }
         )
 
+    base_url = build_base_url(request)
+
     cached = cache_get(url)
+
     if cached:
+        proxy_url = "%s/stream?url=%s" % (
+            base_url,
+            quote_plus(cached)
+        )
+
         return {
             "ok": True,
             "cached": True,
             "url": cached,
+            "proxy_url": proxy_url,
         }
 
     try:
@@ -594,12 +633,20 @@ def resolve_endpoint(url: str = Query(..., description="Blogger video.g token UR
         final_url = resolver.resolve()
 
         if final_url:
+            final_url = clean_url(final_url)
+
             cache_set(url, final_url)
+
+            proxy_url = "%s/stream?url=%s" % (
+                base_url,
+                quote_plus(final_url)
+            )
 
             return {
                 "ok": True,
                 "cached": False,
                 "url": final_url,
+                "proxy_url": proxy_url,
             }
 
         return JSONResponse(
@@ -608,6 +655,104 @@ def resolve_endpoint(url: str = Query(..., description="Blogger video.g token UR
                 "ok": False,
                 "error": "Nenhuma URL de mídia encontrada",
             }
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": str(e),
+            }
+        )
+
+
+@app.get("/stream")
+def stream_endpoint(
+    request: Request,
+    url: str = Query(..., description="URL final googlevideo/mp4/m3u8")
+):
+    """
+    Proxy de vídeo.
+    O Kodi toca este endpoint.
+    O Render acessa o googlevideo e repassa o conteúdo para o Kodi.
+
+    Isso evita 403 causado por link preso ao IP do servidor.
+    """
+    url = clean_url(url)
+
+    if not is_media_url(url):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "URL de mídia inválida",
+            }
+        )
+
+    try:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "keep-alive",
+        }
+
+        # Importante para o Kodi conseguir avançar/continuar vídeo
+        range_header = request.headers.get("range")
+
+        if range_header:
+            headers["Range"] = range_header
+
+        upstream = requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=60
+        )
+
+        if upstream.status_code >= 400:
+            return JSONResponse(
+                status_code=upstream.status_code,
+                content={
+                    "ok": False,
+                    "error": "Erro acessando mídia no servidor",
+                    "status": upstream.status_code,
+                }
+            )
+
+        response_headers = {
+            "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
+            "Cache-Control": "no-store",
+        }
+
+        if upstream.headers.get("content-length"):
+            response_headers["Content-Length"] = upstream.headers.get("content-length")
+
+        if upstream.headers.get("content-range"):
+            response_headers["Content-Range"] = upstream.headers.get("content-range")
+
+        if upstream.headers.get("content-disposition"):
+            response_headers["Content-Disposition"] = upstream.headers.get("content-disposition")
+
+        content_type = upstream.headers.get("content-type", "video/mp4")
+
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=1024 * 512):
+                    if chunk:
+                        yield chunk
+            finally:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+
+        return StreamingResponse(
+            generate(),
+            status_code=upstream.status_code,
+            media_type=content_type,
+            headers=response_headers
         )
 
     except Exception as e:
