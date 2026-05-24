@@ -279,6 +279,7 @@ def criar_driver():
         "profile.managed_default_content_settings.images": 2,
         "profile.default_content_setting_values.notifications": 2,
     }
+
     options.add_experimental_option("prefs", prefs)
 
     options.add_argument("--headless=new")
@@ -295,10 +296,13 @@ def criar_driver():
     options.add_argument("--window-size=1280,720")
     options.add_argument("--user-agent=%s" % USER_AGENT)
 
-    options.set_capability("goog:loggingPrefs", {
-        "performance": "ALL",
-        "browser": "ALL",
-    })
+    options.set_capability(
+        "goog:loggingPrefs",
+        {
+            "performance": "ALL",
+            "browser": "ALL",
+        }
+    )
 
     service = Service(CHROMEDRIVER)
 
@@ -329,6 +333,7 @@ class BloggerResolver:
             driver.save_screenshot(str(png_path))
 
             ids = re.findall(r"vi_blogger/([^/]+)/", html)
+
             for vid in sorted(set(ids)):
                 self.achados_importantes.add("vi_blogger:" + vid)
 
@@ -426,10 +431,25 @@ class BloggerResolver:
                 const x = window.innerWidth / 2;
                 const y = window.innerHeight / 2;
                 const el = document.elementFromPoint(x, y);
+
                 if (el) {
-                    el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, clientX:x, clientY:y}));
-                    el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, clientX:x, clientY:y}));
-                    el.dispatchEvent(new MouseEvent('click', {bubbles:true, clientX:x, clientY:y}));
+                    el.dispatchEvent(new MouseEvent('mousedown', {
+                        bubbles: true,
+                        clientX: x,
+                        clientY: y
+                    }));
+
+                    el.dispatchEvent(new MouseEvent('mouseup', {
+                        bubbles: true,
+                        clientX: x,
+                        clientY: y
+                    }));
+
+                    el.dispatchEvent(new MouseEvent('click', {
+                        bubbles: true,
+                        clientX: x,
+                        clientY: y
+                    }));
                 }
             """)
         except Exception:
@@ -442,18 +462,22 @@ class BloggerResolver:
         try:
             driver.execute_script("""
                 const videos = document.querySelectorAll('video');
+
                 for (const v of videos) {
                     v.muted = true;
-                    v.play().catch(()=>{});
+                    v.play().catch(() => {});
                 }
             """)
         except Exception:
             pass
 
     def salvar_iframes(self, driver):
-        if not DEBUG_SAVE:
-            return
+        """
+        Lê iframes SEM depender do DEBUG_SAVE.
 
+        DEBUG_SAVE controla apenas se vai salvar HTML/PNG/logs.
+        A extração de vídeos precisa rodar sempre.
+        """
         try:
             driver.switch_to.default_content()
         except Exception:
@@ -469,43 +493,65 @@ class BloggerResolver:
                 src = iframe.get_attribute("src") or ""
 
                 if src:
-                    self.achados_importantes.add(clean_url(src))
+                    src = clean_url(src)
+                    self.achados_importantes.add(src)
+
+                    if is_media_url(src):
+                        self.achados_midia.add(src)
 
                 driver.switch_to.frame(iframe)
 
-                html = driver.page_source
+                html = driver.page_source or ""
 
-                try:
-                    iframe_html_path = self.out_dir / f"iframe_{i}.html"
-                    iframe_png_path = self.out_dir / f"iframe_{i}.png"
+                # Salva debug só se estiver ativado
+                if DEBUG_SAVE:
+                    try:
+                        iframe_html_path = self.out_dir / f"iframe_{i}.html"
+                        iframe_png_path = self.out_dir / f"iframe_{i}.png"
 
-                    iframe_html_path.write_text(html, encoding="utf-8", errors="ignore")
-                    driver.save_screenshot(str(iframe_png_path))
-                except Exception:
-                    pass
+                        iframe_html_path.write_text(
+                            html,
+                            encoding="utf-8",
+                            errors="ignore"
+                        )
 
+                        driver.save_screenshot(str(iframe_png_path))
+
+                    except Exception:
+                        pass
+
+                # Procura tags <video>
                 try:
                     videos = driver.find_elements("tag name", "video")
 
                     for v in videos:
                         src_attr = v.get_attribute("src") or ""
+
                         current_src = driver.execute_script(
                             "return arguments[0].currentSrc || '';",
                             v
                         )
 
-                        if src_attr and is_media_url(src_attr):
-                            self.achados_midia.add(clean_url(src_attr))
+                        if src_attr:
+                            src_attr = clean_url(src_attr)
 
-                        if current_src and is_media_url(current_src):
-                            self.achados_midia.add(clean_url(current_src))
+                            if is_media_url(src_attr):
+                                self.achados_midia.add(src_attr)
+
+                        if current_src:
+                            current_src = clean_url(current_src)
+
+                            if is_media_url(current_src):
+                                self.achados_midia.add(current_src)
 
                 except Exception:
                     pass
 
+                # Procura URLs dentro do HTML do iframe
                 urls = re.findall(r'https?://[^"\'<>\\]+', html)
 
                 for u in urls:
+                    u = clean_url(u)
                     ul = u.lower()
 
                     if (
@@ -517,10 +563,10 @@ class BloggerResolver:
                         or "ytimg" in ul
                         or "blogger" in ul
                     ):
-                        self.achados_importantes.add(clean_url(u))
+                        self.achados_importantes.add(u)
 
                         if is_media_url(u):
-                            self.achados_midia.add(clean_url(u))
+                            self.achados_midia.add(u)
 
                 driver.switch_to.default_content()
 
@@ -561,14 +607,23 @@ class BloggerResolver:
 
         try:
             driver = get_driver()
+
+            try:
+                driver.get_log("performance")
+            except Exception:
+                pass
+
             driver.get(self.url)
 
-            time.sleep(3)
+            # Igual ao seu script antigo: dá tempo do Blogger montar o player
+            time.sleep(8)
 
             self.salvar_estado(driver, "blogger_antes")
             self.analisar_logs(driver)
+            self.salvar_iframes(driver)
 
             best = escolher_melhor_url(self.achados_midia)
+
             if best:
                 self.salvar_debug()
                 return best
@@ -581,18 +636,24 @@ class BloggerResolver:
             self.analisar_logs(driver)
 
             best = escolher_melhor_url(self.achados_midia)
+
             if best:
                 self.salvar_debug()
                 return best
 
-            for i in range(WAIT_SECONDS):
+            # Mais tempo, igual ao teste antigo que funcionava
+            observe_seconds = max(WAIT_SECONDS, 45)
+
+            for i in range(observe_seconds):
                 self.analisar_logs(driver)
 
-                if i in (3, 6, 9):
+                if i in (5, 10, 15, 20, 30, 40):
                     self.tentar_video_js(driver)
                     self.salvar_iframes(driver)
+                    self.analisar_logs(driver)
 
                 best = escolher_melhor_url(self.achados_midia)
+
                 if best:
                     self.salvar_debug()
                     return best
@@ -628,7 +689,7 @@ def home():
             "health": "/health",
             "warmup": "/warmup",
             "resolve": "/resolve?url=https://www.blogger.com/video.g?token=TOKEN",
-            "stream": "/stream?url=URL_DA_MIDIA"
+            "stream": "/stream?url=URL_DA_MIDIA",
         }
     }
 
@@ -669,6 +730,7 @@ def warmup():
 
     except Exception as e:
         reset_driver()
+
         return JSONResponse(
             status_code=500,
             content={
@@ -818,6 +880,7 @@ def stream_endpoint(
 
         for h in passthrough_headers:
             value = upstream.headers.get(h)
+
             if value:
                 response_headers[h.title()] = value
 
