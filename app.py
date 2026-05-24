@@ -757,13 +757,6 @@ def stream_endpoint(
     request: Request,
     url: str = Query(..., description="URL final googlevideo/mp4/m3u8")
 ):
-    """
-    Proxy de vídeo.
-    O Kodi toca este endpoint.
-    O Render acessa o googlevideo e repassa o conteúdo para o Kodi.
-
-    Isso evita 403 causado por link preso ao IP do servidor.
-    """
     url = clean_url(url)
 
     if not is_media_url(url):
@@ -781,9 +774,11 @@ def stream_endpoint(
             "Accept": "*/*",
             "Accept-Encoding": "identity",
             "Connection": "keep-alive",
+            "Referer": "https://www.blogger.com/",
+            "Origin": "https://www.blogger.com",
         }
 
-        range_header = request.headers.get("range")
+        range_header = request.headers.get("range") or request.headers.get("Range")
 
         if range_header:
             headers["Range"] = range_header
@@ -792,7 +787,8 @@ def stream_endpoint(
             url,
             headers=headers,
             stream=True,
-            timeout=60
+            timeout=(15, 120),
+            allow_redirects=True
         )
 
         if upstream.status_code >= 400:
@@ -802,28 +798,34 @@ def stream_endpoint(
                     "ok": False,
                     "error": "Erro acessando mídia no servidor",
                     "status": upstream.status_code,
+                    "url": url[:120],
                 }
             )
 
         response_headers = {
             "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
             "Cache-Control": "no-store",
+            "Connection": "keep-alive",
         }
 
-        if upstream.headers.get("content-length"):
-            response_headers["Content-Length"] = upstream.headers.get("content-length")
+        passthrough_headers = [
+            "content-length",
+            "content-range",
+            "content-disposition",
+            "etag",
+            "last-modified",
+        ]
 
-        if upstream.headers.get("content-range"):
-            response_headers["Content-Range"] = upstream.headers.get("content-range")
-
-        if upstream.headers.get("content-disposition"):
-            response_headers["Content-Disposition"] = upstream.headers.get("content-disposition")
+        for h in passthrough_headers:
+            value = upstream.headers.get(h)
+            if value:
+                response_headers[h.title()] = value
 
         content_type = upstream.headers.get("content-type", "video/mp4")
 
         def generate():
             try:
-                for chunk in upstream.iter_content(chunk_size=1024 * 512):
+                for chunk in upstream.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         yield chunk
             finally:
